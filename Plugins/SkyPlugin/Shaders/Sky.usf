@@ -1,0 +1,438 @@
+#include "/Engine/Public/Platform.ush"
+
+#define BIG_NUMBER 999999999.f
+
+#define MATH_PI 3.1415926535f
+#define MATH_E 2.7182818284f
+
+// Color wavelenth peaks in meters
+// used in scatttering coefficient calculation?
+#define WAVELENGTH_R 0.000000680f
+#define WAVELENGTH_G 0.000000550f
+#define WAVELENGTH_B 0.000000440f
+
+// Radius of the Earth and the Earth atmosphere in meters
+#define RADIUS_EARTH 6360000.f
+#define RADIUS_EARTH_ATMOSPHERE 6420000.f
+#define RADIUS_EARTH_ATMOSPHERE_DIFF (RADIUS_EARTH_ATMOSPHERE - RADIUS_EARTH)
+
+// air density at sea level (0 height) at 101.325 kPa and 20C. Is in kg/cubic meter
+#define AIR_DENSITY_0 1.225f
+
+// Constants for Rayleigh scattering
+// RELE_BS_0 (scattering coefficient) is in 1/meters, different for 3 color peaks
+// RELE_H_0 (scale height) is in meters
+// RELE_BA_0 (absorbtion coefficient) for atmosphere assumed to be zero
+// therefore RELE_BE_0 (extinction coefficient) equals to scattering coefficient for atmosphere
+// Atmosphere is not anisotropic therefore RELE_G is zero?
+#define RELE_BS_0_R 0.0000058f
+#define RELE_BS_0_G 0.0000135f
+#define RELE_BS_0_B 0.0000331f
+#define RELE_BE_0_R RELE_BS_0_R
+#define RELE_BE_0_G RELE_BS_0_G
+#define RELE_BE_0_B RELE_BS_0_B
+#define RELE_BE_VEC float3(RELE_BE_0_R,RELE_BE_0_G,RELE_BE_0_B)
+#define RELE_H_0 8000.f
+#define RELE_G 0.f
+
+// Constants for Mie scattering
+// MIE_B_0 (scattering coefficient) is in 1/meters, for all color peaks
+// MIE_H_0 (scale height) is in meters
+// MIE_G (anisotropy) is unitless?
+#define MIE_BS_0 0.0000210f
+#define MIE_BA_0 (0.1*MIE_BS_0)
+#define MIE_BE_0 (MIE_BS_0+MIE_BA_0)
+#define MIE_BS_VEC float3(MIE_BS_0,MIE_BS_0,MIE_BS_0)
+#define MIE_H_0 1200.f
+#define MIE_G 0.76f
+
+struct SkyFunctions
+{
+	// general PhaseFunction that doesn't use cos_tau if g = 0, should be correct???
+	static float PhaseFunction_HenyeyGreenstein(const float cos_tau, const float g)
+	{
+		static float universal_scattering = 1 / (4*MATH_PI);
+		const float g_squared = pow(g,2.f);
+		const float numerator = 1.f-g_squared;
+		const float denominator = pow(1.f+g_squared-2.f*g*cos_tau,1.5f);
+		
+		return universal_scattering * numerator/denominator;
+	}
+	
+	// PhaseFunction_Mie but with g=0
+	static float PhaseFunction_Rayleigh(float cos_tau)
+	{
+		float cos_tau_squared = pow(cos_tau,2.f);
+		
+		return 3.f/(16.f*MATH_PI)*(1.f+cos_tau_squared);
+	}
+
+	static float PhaseFunction_Mie(float cos_tau)
+	{
+		float cos_tau_squared = pow(cos_tau,2.f);
+		float g_squared = pow(MIE_G,2.f);
+		float numerator = (1.f-g_squared)*(1+cos_tau_squared);
+		float denominator = (2.f+g_squared)*pow((1.f+g_squared-2.f*MIE_G*cos_tau),1.5f);
+		
+		return 3.f/(8.f*MATH_PI)*numerator/denominator;
+	}
+
+	static float AtmosphereDensity(float height, float scale_height)
+	{
+		return AIR_DENSITY_0*pow(MATH_E,(-height/scale_height));
+	}
+
+	// Add scatterings together when calculating part of light that went into camera
+	static float3 SkyColorFixed(float3 SkyPos, float3 PixelPos, float SunIntensity)
+	{
+		float3 PointC = float3(0,0,RADIUS_EARTH);
+		float3 SunDirection = normalize(SkyPos);
+		float3 Direction = normalize(PixelPos);
+		float CosTau = dot(Direction,SunDirection);
+
+		float AtmInterBelow, CameraRayDistance;
+		if (!RaySphereIntersect(PointC, Direction, RADIUS_EARTH_ATMOSPHERE, AtmInterBelow, CameraRayDistance) || CameraRayDistance < 0) return float3(0,0,0);
+
+		int NumSamplesCameraRay = 16;
+		int NumSamplesLightRay = 8;
+
+		float CameraRaySegmentLength = CameraRayDistance / NumSamplesCameraRay;
+		float TraveledDistanceAlongCameraRay = 0.f;
+
+		float3 ColorAcc = float3(0,0,0);
+		float RayleighCameraOpticalDepthAcc = 0;
+		float RayleighPhase = PhaseFunction_HenyeyGreenstein(CosTau, 0.f);
+		
+		float MieCameraOpticalDepthAcc = 0;
+		float MiePhase = PhaseFunction_HenyeyGreenstein(CosTau, MIE_G);	
+
+		for (int i = 0; i < NumSamplesCameraRay; ++i)
+		{
+			// PointB is middle of camera ray sample segment
+			float3 PointB = PointC + Direction * (TraveledDistanceAlongCameraRay + CameraRaySegmentLength/2.f);
+			float PointBHeight = length(PointB) / RADIUS_EARTH;
+
+			float RayleighCameraSegmentDepth = exp(-PointBHeight / RELE_H_0) * CameraRaySegmentLength;
+			RayleighCameraOpticalDepthAcc += RayleighCameraSegmentDepth;
+
+			float MieCameraSegmentDepth = exp(-PointBHeight / MIE_H_0) * CameraRaySegmentLength;
+			MieCameraOpticalDepthAcc += MieCameraSegmentDepth;
+
+			float LightInter1, LightRayDistance;
+			RaySphereIntersect(PointB, SunDirection, RADIUS_EARTH_ATMOSPHERE, LightInter1, LightRayDistance);
+			float LightRaySegmentLength = LightRayDistance / NumSamplesLightRay;
+			float TraveledDistanceAlongLightRay = 0;
+			
+			float RayleighLightOpticalDepthAcc = 0;
+			float MieLightOpticalDepthAcc = 0;
+
+			int j;
+			for (j = 0; j < NumSamplesLightRay; ++j)
+			{
+				// PointS is middle of light ray sample segment
+				float3 PointS = PointB + SunDirection * (TraveledDistanceAlongLightRay + LightRaySegmentLength/2.f);
+				float PointSHeight = length(PointS) - RADIUS_EARTH;
+				if (PointSHeight < 0) break;
+				
+				float RayleighLightRaySegmentDepth = exp(-PointSHeight/RELE_H_0) * LightRaySegmentLength;
+				RayleighLightOpticalDepthAcc += RayleighLightRaySegmentDepth;
+
+				float MieLightRaySegmentDepth = exp(-PointSHeight/MIE_H_0) * LightRaySegmentLength;
+				MieLightOpticalDepthAcc += MieLightRaySegmentDepth;
+
+				TraveledDistanceAlongLightRay += LightRaySegmentLength;
+			}
+
+			if (j == NumSamplesLightRay)
+			{
+				float3 Transmission = exp(-RELE_BE_VEC*(RayleighCameraOpticalDepthAcc+RayleighLightOpticalDepthAcc) +
+										  -MIE_BS_VEC*1.1*(MieCameraOpticalDepthAcc+MieLightOpticalDepthAcc));
+				// Initially this was very confusing for me, but basically we multiply transmission by scattering and by segment length,
+				// but scattering is exp by constant and we multiply by constant at the very end so we left with exp and segment length (dS)
+				// and exp(-h/H0)*dS is optical depth of segment
+				ColorAcc += Transmission*(RayleighCameraSegmentDepth*RELE_BE_VEC*RayleighPhase + MieCameraSegmentDepth*MIE_BS_VEC*MiePhase);
+			}
+			
+			TraveledDistanceAlongCameraRay += CameraRaySegmentLength;
+		}
+
+		return ColorAcc * SunIntensity;
+	}
+
+	static float3 SkyColor(float3 SkyPos, float3 PixelPos, float SunIntensity)
+	{
+		float3 PointC = float3(0,0,RADIUS_EARTH);
+		float3 SunDirection = normalize(SkyPos);
+		float3 Direction = normalize(PixelPos);
+		float CosTau = dot(Direction,SunDirection);
+
+		float AtmInterBelow, CameraRayDistance;
+		if (!RaySphereIntersect(PointC, Direction, RADIUS_EARTH_ATMOSPHERE, AtmInterBelow, CameraRayDistance) || CameraRayDistance < 0) return float3(0,0,0);
+
+		int NumSamplesCameraRay = 16;
+		int NumSamplesLightRay = 8;
+
+		float CameraRaySegmentLength = CameraRayDistance / NumSamplesCameraRay;
+		float TraveledDistanceAlongCameraRay = 0.f;
+
+		float3 RayleighColorAcc = float3(0,0,0);
+		float RayleighCameraOpticalDepthAcc = 0;
+		float RayleighPhase = PhaseFunction_Rayleigh(CosTau);
+		
+		float3 MieColorAcc = float3(0,0,0);
+		float MieCameraOpticalDepthAcc = 0;
+		float MiePhase = PhaseFunction_Mie(CosTau);	
+
+		for (int i = 0; i < NumSamplesCameraRay; ++i)
+		{
+			// PointB is middle of camera ray sample segment
+			float3 PointB = PointC + Direction * (TraveledDistanceAlongCameraRay + CameraRaySegmentLength/2.f);
+			float PointBHeight = length(PointB) / RADIUS_EARTH;
+
+			float RayleighCameraSegmentDepth = exp(-PointBHeight / RELE_H_0) * CameraRaySegmentLength;
+			RayleighCameraOpticalDepthAcc += RayleighCameraSegmentDepth;
+
+			float MieCameraSegmentDepth = exp(-PointBHeight / MIE_H_0) * CameraRaySegmentLength;
+			MieCameraOpticalDepthAcc += MieCameraSegmentDepth;
+
+			float LightInter1, LightRayDistance;
+			RaySphereIntersect(PointB, SunDirection, RADIUS_EARTH_ATMOSPHERE, LightInter1, LightRayDistance);
+			float LightRaySegmentLength = LightRayDistance / NumSamplesLightRay;
+			float TraveledDistanceAlongLightRay = 0;
+			
+			float RayleighLightOpticalDepthAcc = 0;
+			float MieLightOpticalDepthAcc = 0;
+
+			int j;
+			for (j = 0; j < NumSamplesLightRay; ++j)
+			{
+				// PointS is middle of light ray sample segment
+				float3 PointS = PointB + SunDirection * (TraveledDistanceAlongLightRay + LightRaySegmentLength/2.f);
+				float PointSHeight = length(PointS) - RADIUS_EARTH;
+				if (PointSHeight < 0) break;
+				
+				float RayleighLightRaySegmentDepth = exp(-PointSHeight/RELE_H_0) * LightRaySegmentLength;
+				RayleighLightOpticalDepthAcc += RayleighLightRaySegmentDepth;
+
+				float MieLightRaySegmentDepth = exp(-PointSHeight/MIE_H_0) * LightRaySegmentLength;
+				MieLightOpticalDepthAcc += MieLightRaySegmentDepth;
+
+				TraveledDistanceAlongLightRay += LightRaySegmentLength;
+			}
+
+			if (j == NumSamplesLightRay)
+			{
+				float3 Transmission = exp(-RELE_BE_VEC*(RayleighCameraOpticalDepthAcc+RayleighLightOpticalDepthAcc) +
+										  -MIE_BS_VEC*1.1*(MieCameraOpticalDepthAcc+MieLightOpticalDepthAcc));
+				// Initially this was very confusing for me, but basically we multiply transmission by scattering and by segment length,
+				// but scattering is exp by constant and we multiply by constant at the very end so we left with exp and segment length (dS)
+				// and exp(-h/H0)*dS is optical depth of segment
+				RayleighColorAcc += Transmission*RayleighCameraSegmentDepth;
+				MieColorAcc += Transmission*MieCameraSegmentDepth;
+			}
+			
+			TraveledDistanceAlongCameraRay += CameraRaySegmentLength;
+		}
+
+		return ( MieColorAcc * MIE_BS_VEC * MiePhase + RayleighColorAcc * RELE_BE_VEC * RayleighPhase) * SunIntensity;
+	}
+
+	static float3 SkyColorOnlyRayleigh(float3 SkyPos, float3 PixelPos, float SunIntensity)
+	{
+		float3 PointC = float3(0,0,RADIUS_EARTH);
+		float3 SunDirection = normalize(SkyPos);
+		float3 Direction = normalize(PixelPos);
+		float CosTau = dot(Direction,SunDirection);
+
+		float AtmInterBelow, CameraRayDistance;
+		if (!RaySphereIntersect(PointC, Direction, RADIUS_EARTH_ATMOSPHERE, AtmInterBelow, CameraRayDistance) || CameraRayDistance < 0) return float3(0,0,0);
+
+		int NumSamplesCameraRay = 16;
+		int NumSamplesLightRay = 8;
+
+		float CameraRaySegmentLength = CameraRayDistance / NumSamplesCameraRay;
+		float TraveledDistanceAlongCameraRay = 0.f;
+
+		float3 ColorAcc = float3(0,0,0);
+		float CameraOpticalDepthAcc = 0;
+		float Phase = PhaseFunction_Rayleigh(CosTau);
+
+		for (int i = 0; i < NumSamplesCameraRay; ++i)
+		{
+			// PointB is middle of camera ray sample segment
+			float3 PointB = PointC + Direction * (TraveledDistanceAlongCameraRay + CameraRaySegmentLength/2.f);
+			float PointBHeight = length(PointB) / RADIUS_EARTH;
+
+			float CameraSegmentDepth = exp(-PointBHeight / RELE_H_0) * CameraRaySegmentLength;
+			CameraOpticalDepthAcc += CameraSegmentDepth;
+
+			float LightInter1, LightRayDistance;
+			RaySphereIntersect(PointB, SunDirection, RADIUS_EARTH_ATMOSPHERE, LightInter1, LightRayDistance);
+			float LightRaySegmentLength = LightRayDistance / NumSamplesLightRay;
+			float TraveledDistanceAlongLightRay = 0;
+			float LightOpticalDepthAcc = 0;
+
+			int j;
+			for (j = 0; j < NumSamplesLightRay; ++j)
+			{
+				// PointS is middle of light ray sample segment
+				float3 PointS = PointB + SunDirection * (TraveledDistanceAlongLightRay + LightRaySegmentLength/2.f);
+				float PointSHeight = length(PointS) - RADIUS_EARTH;
+				if (PointSHeight < 0) break;
+				float LightRaySegmentDepth = exp(-PointSHeight/RELE_H_0) * LightRaySegmentLength;
+				LightOpticalDepthAcc += LightRaySegmentDepth;
+				TraveledDistanceAlongLightRay += LightRaySegmentLength;
+			}
+
+			if (j == NumSamplesLightRay)
+			{
+				float3 Transmission = exp(-RELE_BE_VEC*(CameraOpticalDepthAcc+LightOpticalDepthAcc));
+				// Initially this was very confusing for me, but basically we multiply transmission by scattering and by segment length,
+				// but scattering is exp by constant and we multiply by constant at the very end so we left with exp and segment length (dS)
+				// and exp(-h/H0)*dS is optical depth of segment
+				ColorAcc += Transmission*CameraSegmentDepth;
+			}
+			
+			TraveledDistanceAlongCameraRay += CameraRaySegmentLength;
+		}
+
+		return ColorAcc * RELE_BE_VEC * Phase * SunIntensity;
+	}
+
+	// Mostly direct copy from https://www.scratchapixel.com/lessons/procedural-generation-virtual-worlds/simulating-sky/simulating-colors-of-the-sky.html
+	// Doesn't work for me (almost complete black for some reason)
+	// P.S. BECAUSE I USE AtmosphereDensity for optical depth instead of coefficients which is wrong but i already made other functions
+	// P.P.S Its wrong anyway because you can't just sum up Mie and Rayleigh colors, they affect each others optical depths and scattering along camera ray
+	static float3 SkyColorScratch(float3 SkyPos, float3 PixelPos, float SunIntensity)
+	{
+		float PlanetRadius = RADIUS_EARTH;
+		
+		float3 CamOrigin = float3(0,0,PlanetRadius);
+		float3 Direction = normalize(PixelPos);
+		float3 SunDirection = normalize(SkyPos);
+
+		float AtmosphereRadius = RADIUS_EARTH_ATMOSPHERE_DIFF + PlanetRadius;
+
+		// Only care about rays from camera that inside atmosphere, everything else is black
+		float AtmInter1, AtmInter2;
+		if (!RaySphereIntersect(CamOrigin, Direction, AtmosphereRadius, AtmInter1, AtmInter2) || AtmInter2 < 0) return 0;
+
+		// Set ray begin and end (bound by atmosphere)
+		float RayBeginT = 0;
+		float RayEndT = BIG_NUMBER;
+		if (AtmInter1 > RayBeginT) RayBeginT = AtmInter1;
+		if (AtmInter2 < RayEndT) RayEndT = AtmInter2;
+		float RayDist = RayEndT - RayBeginT;
+
+		// Integration
+		int NumSamples = 16;
+		int NumSamplesLight = 8;
+		float SegmentLength = RayDist / NumSamples;
+		float CurrentRayT = RayBeginT;
+
+		// Accumulators
+		float3 RayleighPart = 0;
+		float RayleighOpticalDepth = 0;
+		float3 MiePart = 0;
+		float MieOpticalDepth = 0;
+
+		// Phase functions - probability of light bouncing in a particular direction
+		float Tau = dot(Direction, SunDirection);
+		float RayleighPhase = PhaseFunction_HenyeyGreenstein(Tau, RELE_G);
+		float MiePhase = PhaseFunction_HenyeyGreenstein(Tau, MIE_G);
+
+		// Integrating along camera ray
+		for (int i = 0; i < NumSamples; ++i)
+		{
+			float3 SamplePosition = CamOrigin + (CurrentRayT + SegmentLength * 0.5f) * Direction;
+			float Height = length(SamplePosition) - PlanetRadius;
+
+			// Depth along camera ray
+			float RayleighSegmentDepth = AtmosphereDensity(Height, RELE_H_0) * SegmentLength;
+			float MieSegmentDepth = AtmosphereDensity(Height, MIE_H_0) * SegmentLength;
+			RayleighOpticalDepth += RayleighSegmentDepth;
+			MieOpticalDepth += MieSegmentDepth;
+
+			// Length of light that comes through atmosphere to intersect with camera ray in sample position
+			float LightInter1, LightInter2;
+			RaySphereIntersect(SamplePosition, SunDirection, AtmosphereRadius, LightInter1, LightInter2);
+			float SegmentLengthLight = LightInter2 / NumSamplesLight;
+			float CurrentLightT = 0;
+
+			// Depth along sun to camera ray sample point accumulators
+			float RayleighOpticalDepthLight = 0;
+			float MieOpticalDepthLight = 0;
+
+			int LightSamplesPassed;
+			// March along light, accumulate depth, cut off if below ground
+			for (LightSamplesPassed = 0; LightSamplesPassed < NumSamplesLight; ++LightSamplesPassed) {
+				float3 SamplePositionLight = SamplePosition + (CurrentLightT + SegmentLengthLight * 0.5f) * SunDirection;
+				float HeightLight = length(SamplePositionLight) - PlanetRadius;
+				if (HeightLight < 0) break;
+				RayleighOpticalDepthLight += AtmosphereDensity(HeightLight, RELE_H_0) * SegmentLengthLight;
+				MieOpticalDepthLight += AtmosphereDensity(HeightLight, MIE_H_0) * SegmentLengthLight;
+				CurrentLightT += SegmentLengthLight;
+			}
+
+			// Only add light scattered from those rays if they hadn't intersected with ground
+			if (LightSamplesPassed == NumSamplesLight) {
+				float3 Loss = RELE_BE_VEC * (RayleighOpticalDepth + RayleighOpticalDepthLight) + MIE_BS_VEC * 1.1f * (MieOpticalDepth + MieOpticalDepthLight);
+				float3 Attenuation = float3(exp(-Loss.x), exp(-Loss.y), exp(-Loss.z));
+				RayleighPart += Attenuation * RayleighSegmentDepth;
+				MiePart += Attenuation * MieSegmentDepth;
+			}
+			
+			CurrentRayT += SegmentLength;
+		}
+
+		return (RayleighPart*RELE_BE_VEC*RayleighPhase + MiePart*MiePhase*MIE_BS_VEC)*SunIntensity;
+	}
+
+	/*
+	static float CosTau(float3 SkyPos, float3 PixelPos)
+	{
+		return dot(normalize(SkyPos),normalize(PixelPos));
+	}
+	*/
+
+	// Map sqare UV texture to half sphere position
+	static float3 UVToPixelPos(float2 UV)
+	{
+		float RadX = UV.x*2*MATH_PI;
+		float RadY = (1.f - UV.y)*MATH_PI/2.f; // invert because pos increases up and uv decreases up
+		return float3(sin(RadY)*cos(RadX), sin(RadY)*sin(RadX), cos(RadY));
+	}
+
+	// Map half sphere position to sqare UV texture 
+	static float2 PixelPosToUV(float3 PixelPos)
+	{
+		PixelPos = normalize(PixelPos);
+		float Yaw = atan2(-PixelPos.y,-PixelPos.x) + MATH_PI; // negative so Yaw (x,y) quadrant is the same as if picking from world position
+		float Pitch = asin(PixelPos.z);
+		return float2(Yaw/(2.f*MATH_PI),Pitch*2.f/MATH_PI);
+	}
+	
+	static float3 AnglesToVec(float Pitch, float Yaw)
+	{
+		const float PitchRad = radians(Pitch);
+		const float YawRad = radians(Yaw);
+		float X = cos(YawRad)*cos(PitchRad);
+		float Y = sin(YawRad)*cos(PitchRad);
+		float Z = sin(PitchRad);
+		return float3(X,Y,Z);
+	}
+
+	// https://iquilezles.org/articles/intersectors/
+	static bool RaySphereIntersect(float3 ro, float3 rd, float ra, out float t0, out float t1)
+	{
+		float3 oc = ro; // Sphere always at 0,0,0
+		float b = dot(oc,rd);
+		float3 qc = oc-b*rd;
+		float h = ra*ra - dot(qc,qc);
+		if (h < 0.0) return false; // no intersection
+		h = sqrt( h );
+		t0 = -b-h;
+		t1 = -b+h;
+		return true;
+	}
+};
